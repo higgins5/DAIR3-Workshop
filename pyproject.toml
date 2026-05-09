@@ -1,0 +1,16 @@
+[project]
+name = "my-project"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+	"numpy>=1.26",
+	"pandas>=2.2",
+	"matplotlib>=3.9",
+	"openai>=2.36.0",
+	"langchain>=1.2.18",
+	"jupyter>=1.1.1",
+	"scipy>=1.17.1",
+	"pyqt5>=5.15.11",
+	"anthropic>=0.100.0",
+]
+

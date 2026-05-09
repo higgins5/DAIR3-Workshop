@@ -1,0 +1,53 @@
+# -------------------------------------------------------
+# ActivateUVEnv: Activate a uv-managed venv and open VS Code 
+# Usage: ActivateUVEnv <ENV_NAME> <PROJECT_DIR>
+# -------------------------------------------------------
+
+ActivateUVEnv() {
+	local ENV_NAME="$1"
+	local BASE_DIR="$2"
+	local VENV_ROOT="$HOME/uvenv"
+	local VENV_PATH="${VENV_ROOT}/${ENV_NAME}"
+	local VENV_ACTIVATE="${VENV_PATH}/bin/activate" 
+
+	if [ -z "$ENV_NAME" ]; then
+		echo "[ ERROR ] Usage : ActivateUVEnv <env-name > <project-dir>"
+		return 1
+	fi
+	
+	if [ -z "$BASE_DIR" ]; then
+		echo "[ERROR] Usage: ActivateUVEnv <env-name> <project-dir>"
+		return 1
+	fi
+
+	if [ ! -d "$BASE_DIR" ]; then 
+		echo "[ERROR] Project directory not found: ${BASE_DIR}"
+		return 1
+	fi 
+
+
+	# Create environment if it does not exist yet 
+	if [ ! -f "$VENV_ACTIVATE" ]; then 
+		echo "[INFO] Environment '${ENV_NAME}' not found. Creating with uv..." 
+		uv venv "$VENV_PATH" --python 3.12 || return 1 
+	fi
+
+	# Activate
+	cd "$BASE_DIR" || return 1
+	# shellcheck source=/dev/null
+	source "$VENV_ACTIVATE" 
+
+
+	# Sync dependencies if pyproject.toml is present 
+	if [ -f "pyproject.toml" ]; then 
+		echo "[INFO] pyproject.toml found. Syncing dependencies..." 
+		uv sync 
+	fi 
+
+
+	echo "[OK] Environment '${ENV_NAME}' active."
+	echo "Launching VS Code..." 
+	code .
+}
+
+

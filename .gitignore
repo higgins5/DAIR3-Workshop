@@ -339,3 +339,7 @@ TSWLatexianTemp*
 # option is specified. Footnotes are the stored in a file with suffix Notes.bib.
 # Uncomment the next line to have this generated file ignored.
 #*Notes.bib
+
+
+# Don't want to add the environment folder; just want to commit pyproject.toml and uv.lock
+.venv/
