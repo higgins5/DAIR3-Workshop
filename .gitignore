@@ -343,3 +343,8 @@ TSWLatexianTemp*
 
 # Don't want to add the environment folder; just want to commit pyproject.toml and uv.lock
 .venv/
+
+
+## also don't want to add all the nchs .dat / .zip 
+US*
+
