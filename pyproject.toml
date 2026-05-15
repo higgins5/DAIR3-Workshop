@@ -12,5 +12,6 @@ dependencies = [
 	"scipy>=1.17.1",
 	"pyqt5>=5.15.11",
 	"anthropic>=0.100.0",
+	"plotnine>=0.15.4",
 ]
 
