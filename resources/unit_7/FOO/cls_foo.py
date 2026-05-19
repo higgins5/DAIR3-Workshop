@@ -17,6 +17,7 @@ from datetime import datetime
 from cls_openai import OpenAIAgent
 from cls_anthropic import AnthropicAgent
 from cls_blockchain import IntegrityManager
+from md_loader import load_persona, read_md_file
 
 
 class MultiAgentOrchestrator:
@@ -74,18 +75,26 @@ class MultiAgentOrchestrator:
     
     def _initialize_agents(self):
         """Initialize all agents from configuration"""
+        common_md = self.config.get("common_md", "common.md")
         for entry in self.models:
             model_code = entry["model_code"]
             agent_name = entry["agent_name"]
             harmonizer = bool(entry.get("harmonizer", False)) if isinstance(entry.get("harmonizer", False), bool) else str(entry.get("harmonizer", "false")).lower() == "true"
-            
+
+            # Build per-agent instructions from common.md + role .md with variable substitution.
+            role_md = entry.get("instructions_file", "general.md")
+            agent_instructions = load_persona(common_md, role_md, {
+                "user": self.user,
+                "name": agent_name,
+            })
+
             try:
                 if model_code.startswith("claude"):
                     # Create Anthropic agent
                     agent = AnthropicAgent(
                         model=model_code,
                         name=agent_name,
-                        instructions=self.config["instructions"],
+                        instructions=agent_instructions,
                         user=self.user,
                         config=self.config,
                         model_entry=entry  # NEW: Pass the full model entry
@@ -95,18 +104,30 @@ class MultiAgentOrchestrator:
                     agent = OpenAIAgent(
                         model=model_code,
                         name=agent_name,
-                        instructions=self.config["instructions"],
+                        instructions=agent_instructions,
                         user=self.user,
                         config=self.config,
                         model_entry=entry  # NEW: Pass the full model entry
                     )
-                
+
+                # Stash persona source files + the raw model entry so the GUI
+                # can switch roles at runtime and display the friendly model name.
+                agent.common_md = common_md
+                agent.role_md = role_md
+                agent.model_entry = entry
+
                 # Add harmonizer flag
                 agent.harmonizer = harmonizer
-                
-                # Store harmonizer directive if this is a harmonizer agent
-                if harmonizer and "harmonizer_directive" in entry:
-                    agent.harmonizer_directive = entry["harmonizer_directive"]
+
+                # Store harmonizer directive (from file or inline) if this is a harmonizer agent.
+                # The directive contains a {source_agent_name} placeholder that the orchestrator
+                # substitutes at judgment time, so we DO NOT pre-substitute it here.
+                if harmonizer:
+                    directive_file = entry.get("harmonizer_directive_file", "")
+                    if directive_file:
+                        agent.harmonizer_directive = read_md_file(directive_file)
+                    elif "harmonizer_directive" in entry:
+                        agent.harmonizer_directive = entry["harmonizer_directive"]
                 
                 # Initialize blockchain for this agent if conversation history exists
                 if hasattr(agent, 'history_data') and agent.history_data.get('history'):

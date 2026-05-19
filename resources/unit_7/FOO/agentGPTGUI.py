@@ -14,9 +14,18 @@ import openai
 import json
 import sys
 import io
-from PyQt5.QtWidgets import QApplication, QWidget, QTextEdit, QLineEdit, QVBoxLayout, QPushButton
+import glob
+import argparse
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLineEdit, QVBoxLayout, QPushButton,
+    QHBoxLayout, QLabel, QComboBox, QProgressBar
+)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QClipboard
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QClipboard, QFont
+from md_widget import MarkdownTextEdit
+from md_loader import load_persona
+from file_upload_worker import FileUploadWorker, format_usage
 
 # Force UTF-8 encoding for stdout and stderr
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -53,12 +62,12 @@ class LLMWorker(QThread):
             self.result_ready.emit(f"Error: {e}")
 
 class OpenAIChatbot(QWidget):
-    def __init__(self):
+    def __init__(self, role_md_path="general.md"):
         super().__init__()
 
         # Load configuration from CONFIG section
         config_file = "config.json"
-        with open(config_file, 'r') as file:
+        with open(config_file, 'r', encoding='utf-8') as file:
             raw_config = json.load(file)
             config = raw_config['CONFIG']
 
@@ -66,10 +75,16 @@ class OpenAIChatbot(QWidget):
         self.user = config['user']
         self.name = config['name']
 
-        # Build instructions with dynamic user and assistant introduction
-        preamble = f"Please address the user as Beloved {self.user}.\\n\\n Introduce yourself as {self.name}, robot extraordinaire.\\n\\n "
-        self.instructions = preamble + config['instructions']
+        # Build instructions from common.md + role markdown with variable substitution
+        self.common_md = config.get('common_md', 'common.md')
+        self.role_md = role_md_path
+        self.instructions = load_persona(self.common_md, self.role_md, {
+            "user": self.user,
+            "name": self.name,
+        })
         self.model = config['model']
+        self.font_size = int(config.get('fontsize', 12))
+        self.loaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.latest_response = ""
 
         # Load API key from environment
@@ -93,19 +108,53 @@ class OpenAIChatbot(QWidget):
     def init_gui(self):
         # Set up main window parameters
         self.setWindowTitle("JuanGPT")
-        self.setGeometry(100, 100, 600, 400)
+        self.setGeometry(100, 100, 700, 500)
         self.setAcceptDrops(True)  # Enable drag and drop
 
         layout = QVBoxLayout()
 
-        # Text display area for messages
-        self.text_area = QTextEdit(self)
-        self.text_area.setReadOnly(True)
+        # --- Header row: Role dropdown (left) + Font +/- (right) ---
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Role:"))
+        self.role_combo = QComboBox()
+        self.role_combo.addItems(self._discover_md_files())
+        if self.role_md in [self.role_combo.itemText(i) for i in range(self.role_combo.count())]:
+            self.role_combo.setCurrentText(self.role_md)
+        self.role_combo.currentTextChanged.connect(self.on_role_changed)
+        header.addWidget(self.role_combo, 1)
+        header.addStretch()
+        self.font_dec_btn = QPushButton("-")
+        self.font_dec_btn.setFixedWidth(32)
+        self.font_dec_btn.clicked.connect(lambda: self.apply_font_size(self.font_size - 1))
+        self.font_inc_btn = QPushButton("+")
+        self.font_inc_btn.setFixedWidth(32)
+        self.font_inc_btn.clicked.connect(lambda: self.apply_font_size(self.font_size + 1))
+        header.addWidget(self.font_dec_btn)
+        header.addWidget(self.font_inc_btn)
+        layout.addLayout(header)
+
+        # Status row (spinner + label) shown while a file upload runs. Hidden when idle.
+        self.status_row = QWidget()
+        status_layout = QHBoxLayout(self.status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        self.upload_progress = QProgressBar()
+        self.upload_progress.setRange(0, 0)
+        self.upload_progress.setFixedWidth(140)
+        self.upload_progress.setTextVisible(False)
+        self.upload_status_label = QLabel("")
+        status_layout.addWidget(self.upload_progress)
+        status_layout.addWidget(self.upload_status_label, 1)
+        self.status_row.setVisible(False)
+        layout.addWidget(self.status_row)
+        self.upload_worker = None
+
+        # Text display area for messages (renders Markdown via setMarkdown)
+        self.text_area = MarkdownTextEdit(self)
         layout.addWidget(self.text_area)
 
         # Display session header
-        self.text_area.append(f"Model: {self.model}")
-        self.text_area.append(f"Agent: {self.name}")
+        self.text_area.append(f"**Model:** `{self.model}` (OpenAI) — **Loaded:** {self.loaded_at}")
+        self.text_area.append(f"**Agent:** {self.name} — **Role:** {self.role_md}")
         self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
 
         # User input field
@@ -124,6 +173,38 @@ class OpenAIChatbot(QWidget):
         # Apply layout to the window
         self.setLayout(layout)
 
+        # Apply initial font size to everything
+        self.apply_font_size(self.font_size)
+
+    def _discover_md_files(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(script_dir, "*.md")))
+        return [f for f in files if f != "common.md"]
+
+    def apply_font_size(self, size):
+        self.font_size = max(6, min(48, int(size)))
+        font = QFont()
+        font.setPointSize(self.font_size)
+        for child in self.findChildren(QWidget):
+            child.setFont(font)
+        self.text_area.document().setDefaultFont(font)
+        self.text_area.rerender()
+
+    def on_role_changed(self, role):
+        if not role or role == self.role_md:
+            return
+        self.role_md = role
+        self.instructions = load_persona(self.common_md, self.role_md, {
+            "user": self.user,
+            "name": self.name,
+        })
+        # Reset Responses API chain so the new role doesn't carry old context.
+        self.previous_response_id = None
+        self.text_area.clear()
+        self.text_area.append(f"**Model:** `{self.model}` (OpenAI) — **Loaded:** {self.loaded_at}")
+        self.text_area.append(f"**Agent:** {self.name} — **Role changed to:** {self.role_md}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         # Accept drag event if a file is present
         if event.mimeData().hasUrls():
@@ -139,31 +220,68 @@ class OpenAIChatbot(QWidget):
             self.upload_file(file_path)
 
     def upload_file(self, file_path):
-        # Upload a file and register it with the file_search vector store
-        try:
+        """Drag-and-drop entry. Runs on a background QThread so the GUI shows
+        a live spinner + status label instead of freezing."""
+        if self.upload_worker is not None and self.upload_worker.isRunning():
+            self.text_area.append(f"_(Already uploading; ignored drop of `{file_path}`)_")
+            return
+
+        filename = os.path.basename(file_path)
+        client = self.client
+        name = self.name
+
+        def do_upload(status_cb):
+            status_cb("Uploading file to OpenAI (remote)")
             with open(file_path, 'rb') as file_data:
-                file_object = self.client.files.create(
-                    file=file_data,
-                    purpose='assistants'
-                )
-            self.text_area.append(f"File uploaded successfully: ID {file_object.id}")
+                file_object = client.files.create(file=file_data, purpose='assistants')
+            file_id = file_object.id
 
-            try:
-                if self.vector_store_id is None:
-                    vs = self.client.vector_stores.create(name=f"{self.name}_files")
-                    self.vector_store_id = vs.id
+            status_cb("Indexing in vector store (remote)")
+            if self.vector_store_id is None:
+                vs = client.vector_stores.create(name=f"{name}_files")
+                self.vector_store_id = vs.id
+            client.vector_stores.files.create_and_poll(
+                vector_store_id=self.vector_store_id,
+                file_id=file_id,
+            )
+            return f"File uploaded and indexed. ID: `{file_id}`", None
 
-                self.client.vector_stores.files.create_and_poll(
-                    vector_store_id=self.vector_store_id,
-                    file_id=file_object.id,
-                )
-                self.text_area.append(f"File indexed in vector store {self.vector_store_id}")
-            except Exception as e:
-                self.text_area.append(f"Failed to index file for search: {e}")
+        self.text_area.append(f"**Processing file:** `{filename}`")
+        self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
+        self._show_upload_status("Starting upload…")
 
-            self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
-        except Exception as e:
-            self.text_area.append(f"Failed to upload file: {e}")
+        self.upload_worker = FileUploadWorker(do_upload)
+        self.upload_worker.status.connect(self._on_upload_status)
+        self.upload_worker.finished_ok.connect(self._on_upload_finished)
+        self.upload_worker.finished_err.connect(self._on_upload_error)
+        self.upload_worker.start()
+
+    def _show_upload_status(self, msg):
+        self.upload_status_label.setText(msg)
+        self.status_row.setVisible(True)
+
+    def _hide_upload_status(self):
+        self.status_row.setVisible(False)
+        self.upload_status_label.setText("")
+
+    def _on_upload_status(self, msg):
+        self._show_upload_status(msg)
+        self.text_area.append(f"_…{msg}_")
+
+    def _on_upload_finished(self, response, usage):
+        usage_str = format_usage(usage) if usage else ""
+        if usage_str:
+            self.text_area.append(f"_Done — tokens: {usage_str}_")
+        else:
+            self.text_area.append("_Done._")
+        self._hide_upload_status()
+        self.text_area.append(response)
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+    def _on_upload_error(self, msg):
+        self._hide_upload_status()
+        self.text_area.append(f"**Upload error:** {msg}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
 
     def on_enter_pressed(self):
         # Process input when Enter is pressed
@@ -198,7 +316,16 @@ class OpenAIChatbot(QWidget):
 
 # Start the GUI application
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Single-OpenAI-agent chat GUI.")
+    parser.add_argument(
+        "role_md",
+        nargs="?",
+        default="general.md",
+        help="Path to a role markdown file (default: general.md). Examples: researcher.md, grant_writer_NIH.md, article_reviewer.md.",
+    )
+    args = parser.parse_args()
+
     app = QApplication([])
-    chatbot = OpenAIChatbot()
+    chatbot = OpenAIChatbot(role_md_path=args.role_md)
     chatbot.show()
     app.exec_()

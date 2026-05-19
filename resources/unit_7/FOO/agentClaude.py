@@ -1,425 +1,388 @@
+"""
+agentClaude.py
+GUI chatbot interface using the Anthropic Claude API.
+Configuration is loaded from config.json (CONFIG section: user, name, instructions,
+optional claude_model). Drag-and-drop a PDF or image onto the window to attach it
+to the conversation.
+
+By Juan B. Gutiérrez, Professor of Mathematics
+University of Texas at San Antonio.
+
+License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+"""
 import os
 import sys
-import json
 import io
-import openai
+import json
+import glob
+import argparse
+import base64
+import mimetypes
+from datetime import datetime
 import anthropic
-from google import genai
-from google.genai import types
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QTextEdit, QLineEdit, QVBoxLayout,
-    QPushButton, QTabWidget, QHBoxLayout, QCheckBox, QLabel, QScrollArea,
-    QSpinBox
+    QApplication, QWidget, QLineEdit, QVBoxLayout, QPushButton,
+    QHBoxLayout, QLabel, QComboBox, QProgressBar
 )
 from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont
+from md_widget import MarkdownTextEdit
+from md_loader import load_persona
+from file_upload_worker import FileUploadWorker, format_usage
+
+
+# Anthropic deprecated temperature on Opus 4.7+. Returns {'temperature': v}
+# only for models that still accept it.
+_TEMPERATURE_DEPRECATED_PREFIXES = ("claude-opus-4-7",)
+
+
+def _temperature_kwarg(model, value):
+    for prefix in _TEMPERATURE_DEPRECATED_PREFIXES:
+        if model.startswith(prefix):
+            return {}
+    return {"temperature": value}
 
 # Force UTF-8 encoding for stdout and stderr
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-HARMONIZER_FALLBACK_DIRECTIVE = (
-    "The following statements are the flaws others found for agent {source_agent_name}'s response."
-    " Organize their responses by topic in an additive manner (that is, do not eliminate information)."
-    " Structure your response using the following sections: 'Agreement', 'Disagreement', and 'Unique observations'."
-    " In 'Agreement', list ideas supported by multiple agents. In 'Disagreement', note contradictory statements."
-    " In 'Unique observations', highlight observations made by only one agent."
-    " The agent under review needs detailed responses to be able to improve."
-    " Produce the content for these sections with detailed bulletpoints."
-)
 
-
-class OpenAIWorker(QThread):
+class LLMWorker(QThread):
     result_ready = pyqtSignal(str)
 
-    def __init__(self, user_input, client, model, instructions, tab):
+    def __init__(self, user_input, chatbot):
         super().__init__()
         self.user_input = user_input
-        self.client = client
-        self.model = model
-        self.instructions = instructions
-        self.tab = tab  # owns previous_response_id for conversation continuity
+        self.chatbot = chatbot  # owns client, model, instructions, history
 
     def run(self):
         try:
-            kwargs = {
-                "model": self.model,
-                "instructions": self.instructions,
-                "input": self.user_input,
-            }
-            if self.tab.previous_response_id:
-                kwargs["previous_response_id"] = self.tab.previous_response_id
-
-            response = self.client.responses.create(**kwargs)
-            self.tab.previous_response_id = response.id
-            self.result_ready.emit(response.output_text)
-        except Exception as e:
-            self.result_ready.emit(f"Error: {e}")
-
-class GoogleWorker(QThread):
-    result_ready = pyqtSignal(str)
-
-    def __init__(self, user_input, chat):
-        super().__init__()
-        self.user_input = user_input
-        self.chat = chat  # stateful chat session owned by the tab
-
-    def run(self):
-        try:
-            response = self.chat.send_message(self.user_input)
-            self.result_ready.emit(response.text)
-        except Exception as e:
-            self.result_ready.emit(f"Error: {e}")
-
-class ClaudeWorker(QThread):
-    result_ready = pyqtSignal(str)
-
-    def __init__(self, user_input, client, model, history):
-        super().__init__()
-        self.user_input = user_input
-        self.client = client
-        self.model = model
-        self.history = history
-
-    def run(self):
-        try:
-            self.history.append({"role": "user", "content": self.user_input})
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                temperature=0.99,
-                messages=self.history
+            self.chatbot.history.append({"role": "user", "content": self.user_input})
+            response = self.chatbot.client.messages.create(
+                model=self.chatbot.model,
+                max_tokens=self.chatbot.max_tokens,
+                system=self.chatbot.instructions,
+                messages=self.chatbot.history,
+                **_temperature_kwarg(self.chatbot.model, self.chatbot.temperature),
             )
             content = response.content[0].text
-            self.history.append({"role": "assistant", "content": content})
+            self.chatbot.history.append({"role": "assistant", "content": content})
             self.result_ready.emit(content)
         except Exception as e:
             self.result_ready.emit(f"Error: {e}")
 
-class AgentTab(QWidget):
-    log_signal = pyqtSignal(str)
 
-    def __init__(self, model, name, instructions, user, engine, harmonizer=False, harmonizer_directive=""):
+class ClaudeChatbot(QWidget):
+    def __init__(self, role_md_path="general.md"):
         super().__init__()
-        self.user = user
-        self.name = name
-        self.model = model
-        self.engine = engine
-        self.harmonizer = harmonizer
-        self.harmonizer_directive = harmonizer_directive or ""
+
+        # Load configuration from CONFIG section
+        config_file = "config.json"
+        with open(config_file, 'r', encoding='utf-8') as file:
+            raw_config = json.load(file)
+            config = raw_config['CONFIG']
+
+        # Extract configuration values
+        self.user = config['user']
+        self.name = config['name']
+
+        # Build instructions from common.md + role markdown with variable substitution
+        self.common_md = config.get('common_md', 'common.md')
+        self.role_md = role_md_path
+        self.instructions = load_persona(self.common_md, self.role_md, {
+            "user": self.user,
+            "name": self.name,
+        })
+        self.model = config.get('claude_model', 'claude-sonnet-4-5-20250929')
+        self.max_tokens = int(config.get('max_tokens', 1000))
+        self.temperature = float(config.get('temperature', 0.7))
+        self.font_size = int(config.get('fontsize', 12))
+        self.loaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.latest_response = ""
-        self.active = True  # Controlled by checkbox
 
-        self.text_area = QTextEdit()
-        self.user_input = QLineEdit()
-        self.copy_button = QPushButton("Copy Latest Answer")
+        # Load API key from environment
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("API key is not set. Please set the ANTHROPIC_API_KEY environment variable.")
+            exit(1)
 
-        if self.engine == "openai":
-            preamble = f"Please address the user as Beloved {user}.\\n\\n Introduce yourself as {name}, robot extraordinaire.\\n\\n "
-            self.instructions = preamble + instructions
-            self.client = openai.OpenAI()
-            self.previous_response_id = None
-        elif self.engine == "google":
-            preamble = f"Please address the user as Beloved {user}.\\n\\n Introduce yourself as {name}, robot extraordinaire.\\n\\n "
-            self.instructions = preamble + instructions
-            self.client = genai.Client(
-                api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-            )
-            self.chat = self.client.chats.create(
-                model=model,
-                config=types.GenerateContentConfig(system_instruction=self.instructions),
-            )
-        else:
-            self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-            self.history = []
+        # Initialize Anthropic client and conversation history
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.history = []
 
-        self.init_ui()
+        # Set up the GUI interface
+        self.init_gui()
 
-    def init_ui(self):
+    def init_gui(self):
+        # Set up main window parameters
+        self.setWindowTitle("JuanClaude")
+        self.setGeometry(100, 100, 700, 500)
+        self.setAcceptDrops(True)  # Enable drag and drop
+
         layout = QVBoxLayout()
 
-        role_text = "Harmonizer" if self.harmonizer else "Reviewer"
-        self.checkbox = QCheckBox(f"Enable {self.name} ({role_text})")
-        self.checkbox.setChecked(True)
-        self.checkbox.stateChanged.connect(self.toggle_active)
-        layout.addWidget(self.checkbox)
+        # --- Header row: Role dropdown (left) + Font +/- (right) ---
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Role:"))
+        self.role_combo = QComboBox()
+        self.role_combo.addItems(self._discover_md_files())
+        if self.role_md in [self.role_combo.itemText(i) for i in range(self.role_combo.count())]:
+            self.role_combo.setCurrentText(self.role_md)
+        self.role_combo.currentTextChanged.connect(self.on_role_changed)
+        header.addWidget(self.role_combo, 1)
+        header.addStretch()
+        self.font_dec_btn = QPushButton("-")
+        self.font_dec_btn.setFixedWidth(32)
+        self.font_dec_btn.clicked.connect(lambda: self.apply_font_size(self.font_size - 1))
+        self.font_inc_btn = QPushButton("+")
+        self.font_inc_btn.setFixedWidth(32)
+        self.font_inc_btn.clicked.connect(lambda: self.apply_font_size(self.font_size + 1))
+        header.addWidget(self.font_dec_btn)
+        header.addWidget(self.font_inc_btn)
+        layout.addLayout(header)
 
-        self.text_area.setReadOnly(True)
+        # Status row (spinner + label) shown while a file upload runs. Hidden when idle.
+        self.status_row = QWidget()
+        status_layout = QHBoxLayout(self.status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        self.upload_progress = QProgressBar()
+        self.upload_progress.setRange(0, 0)
+        self.upload_progress.setFixedWidth(140)
+        self.upload_progress.setTextVisible(False)
+        self.upload_status_label = QLabel("")
+        status_layout.addWidget(self.upload_progress)
+        status_layout.addWidget(self.upload_status_label, 1)
+        self.status_row.setVisible(False)
+        layout.addWidget(self.status_row)
+        self.upload_worker = None
+
+        # Text display area for messages (renders Markdown via setMarkdown)
+        self.text_area = MarkdownTextEdit(self)
         layout.addWidget(self.text_area)
 
+        # Display session header
+        self.text_area.append(f"**Model:** `{self.model}` (Anthropic) — **Loaded:** {self.loaded_at}")
+        self.text_area.append(f"**Agent:** {self.name} — **Role:** {self.role_md}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+        # User input field
+        self.user_input = QLineEdit(self)
         self.user_input.setPlaceholderText("Type your message and press Enter")
         layout.addWidget(self.user_input)
 
+        # Button to copy latest assistant response
+        self.copy_button = QPushButton("Copy Latest Answer")
         self.copy_button.clicked.connect(self.copy_latest_answer)
         layout.addWidget(self.copy_button)
 
-        self.log_signal.connect(self.text_area.append)
+        # Bind Enter key to user input processing
+        self.user_input.returnPressed.connect(self.on_enter_pressed)
 
+        # Apply layout to the window
         self.setLayout(layout)
 
-    def toggle_active(self, state):
-        self.active = bool(state)
+        # Apply initial font size to everything
+        self.apply_font_size(self.font_size)
 
-    def handle_input(self, text):
-        if not self.active:
+    def _discover_md_files(self):
+        # All .md files alongside this script, except the shared common.md.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(script_dir, "*.md")))
+        return [f for f in files if f != "common.md"]
+
+    def apply_font_size(self, size):
+        self.font_size = max(6, min(48, int(size)))
+        font = QFont()
+        font.setPointSize(self.font_size)
+        for child in self.findChildren(QWidget):
+            child.setFont(font)
+        # MarkdownTextEdit's document needs its default font set explicitly,
+        # then re-rendered so the existing content adopts the new size.
+        self.text_area.document().setDefaultFont(font)
+        self.text_area.rerender()
+
+    def on_role_changed(self, role):
+        if not role or role == self.role_md:
+            return
+        self.role_md = role
+        self.instructions = load_persona(self.common_md, self.role_md, {
+            "user": self.user,
+            "name": self.name,
+        })
+        # Reset conversation state so the new role isn't carrying old context.
+        self.history = []
+        self.text_area.clear()
+        self.text_area.append(f"**Model:** `{self.model}` (Anthropic) — **Loaded:** {self.loaded_at}")
+        self.text_area.append(f"**Agent:** {self.name} — **Role changed to:** {self.role_md}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        # Accept drag event if a file is present
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        # Handle file drop by extracting path
+        urls = event.mimeData().urls()
+        if urls:
+            file_path = urls[0].toLocalFile()
+            self.upload_file(file_path)
+
+    def upload_file(self, file_path):
+        """Drag-and-drop entry. Runs on a background QThread so the GUI shows
+        a live spinner + status label instead of freezing."""
+        if self.upload_worker is not None and self.upload_worker.isRunning():
+            self.text_area.append(f"_(Already uploading; ignored drop of `{file_path}`)_")
             return
 
-        self.text_area.append(f"{self.user}: {text}")
+        filename = os.path.basename(file_path)
+        model = self.model
+        history = self.history
+        client = self.client
+        instructions = self.instructions
+        max_tokens = self.max_tokens
+        temperature = self.temperature
+
+        def do_upload(status_cb):
+            status_cb("Classifying file (local)")
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if mime_type and mime_type.startswith("image/"):
+                status_cb("Base64-encoding image (local)")
+                media_kind = "image"
+            elif mime_type == "application/pdf":
+                status_cb("Base64-encoding PDF (local)")
+                media_kind = "pdf"
+            else:
+                raise ValueError(
+                    f"Unsupported file type: {mime_type or 'unknown'}. "
+                    "Claude supports images (jpeg/png/gif/webp) and PDFs via drag-and-drop."
+                )
+
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            b64_data = base64.standard_b64encode(file_bytes).decode("ascii")
+
+            if media_kind == "image":
+                content_block = {"type": "image", "source": {
+                    "type": "base64", "media_type": mime_type, "data": b64_data,
+                }}
+            else:
+                content_block = {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": b64_data,
+                }}
+
+            ack_message = {
+                "role": "user",
+                "content": [
+                    content_block,
+                    {"type": "text", "text": "Please acknowledge this file. I will ask follow-up questions about it."},
+                ],
+            }
+            history.append(ack_message)
+
+            status_cb("Sending to Anthropic Claude (remote)")
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=instructions,
+                messages=history,
+                **_temperature_kwarg(model, temperature),
+            )
+            content = response.content[0].text
+            history.append({"role": "assistant", "content": content})
+
+            usage = None
+            if getattr(response, "usage", None):
+                inp = getattr(response.usage, "input_tokens", None)
+                out = getattr(response.usage, "output_tokens", None)
+                usage = {"input": inp, "output": out,
+                         "total": (inp + out) if (inp is not None and out is not None) else None}
+            return content, usage
+
+        self.text_area.append(f"**Processing file:** `{filename}`")
+        self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
+        self._show_upload_status("Starting upload…")
+
+        self.upload_worker = FileUploadWorker(do_upload)
+        self.upload_worker.status.connect(self._on_upload_status)
+        self.upload_worker.finished_ok.connect(self._on_upload_finished)
+        self.upload_worker.finished_err.connect(self._on_upload_error)
+        self.upload_worker.start()
+
+    def _show_upload_status(self, msg):
+        self.upload_status_label.setText(msg)
+        self.status_row.setVisible(True)
+
+    def _hide_upload_status(self):
+        self.status_row.setVisible(False)
+        self.upload_status_label.setText("")
+
+    def _on_upload_status(self, msg):
+        self._show_upload_status(msg)
+        self.text_area.append(f"_…{msg}_")
+
+    def _on_upload_finished(self, response, usage):
+        usage_str = format_usage(usage) if usage else ""
+        if usage_str:
+            self.text_area.append(f"_Done — tokens: {usage_str}_")
+        else:
+            self.text_area.append("_Done._")
+        self._hide_upload_status()
+        self.latest_response = response
+        self.text_area.append(f"{self.name}: {response}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+    def _on_upload_error(self, msg):
+        self._hide_upload_status()
+        self.text_area.append(f"**Upload error:** {msg}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+    def on_enter_pressed(self):
+        # Process input when Enter is pressed
+        user_input = self.user_input.text().strip()
+        if user_input:
+            self.process_user_input(user_input)
+        self.user_input.clear()
+
+    def process_user_input(self, user_input):
+        # Display user input
+        self.text_area.append(f"{self.user}: {user_input}")
         self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
         self.user_input.setEnabled(False)
 
-        if self.engine == "openai":
-            self.worker = OpenAIWorker(text, self.client, self.model, self.instructions, self)
-        elif self.engine == "google":
-            self.worker = GoogleWorker(text, self.chat)
-        else:
-            self.worker = ClaudeWorker(text, self.client, self.model, self.history)
+        # Launch worker thread to handle assistant response
+        self.worker_thread = LLMWorker(user_input, self)
+        self.worker_thread.result_ready.connect(self.display_results)
+        self.worker_thread.start()
 
-        self.worker.result_ready.connect(self.show_response)
-        self.worker.start()
-
-    def show_response(self, response):
+    def display_results(self, response):
+        # Show assistant response
         self.latest_response = response
         self.text_area.append(f"{self.name}: {response}")
         self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
         self.user_input.setEnabled(True)
 
     def copy_latest_answer(self):
-        QApplication.clipboard().setText(self.latest_response)
+        # Copy latest assistant message to clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.latest_response)
         self.text_area.append("Latest answer copied to clipboard.")
 
-    def send_message_sync(self, text, sender_label=None):
-        sender = sender_label or self.user
-        self.log_signal.emit(f"{sender}: {text}")
-        self.log_signal.emit(">>>>>>>>>>>>>>>>>>>>>>>>>>")
-        try:
-            if self.engine == "openai":
-                response = self._openai_sync(text)
-            elif self.engine == "google":
-                response = self._google_sync(text)
-            else:
-                response = self._claude_sync(text)
-        except Exception as e:
-            response = f"Error: {e}"
-        self.latest_response = response
-        self.log_signal.emit(f"{self.name}: {response}")
-        self.log_signal.emit("<<<<<<<<<<<<<<<<<<<<<<<<<<")
-        return response
 
-    def _openai_sync(self, text):
-        kwargs = {
-            "model": self.model,
-            "instructions": self.instructions,
-            "input": text,
-        }
-        if self.previous_response_id:
-            kwargs["previous_response_id"] = self.previous_response_id
-        response = self.client.responses.create(**kwargs)
-        self.previous_response_id = response.id
-        return response.output_text
-
-    def _google_sync(self, text):
-        return self.chat.send_message(text).text
-
-    def _claude_sync(self, text):
-        self.history.append({"role": "user", "content": text})
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1000,
-            temperature=0.99,
-            messages=self.history,
-        )
-        content = response.content[0].text
-        self.history.append({"role": "assistant", "content": content})
-        return content
-
-
-class FOOOrchestratorWorker(QThread):
-    finished_signal = pyqtSignal()
-
-    def __init__(self, user_text, non_harmonizers, harmonizers, iterations):
-        super().__init__()
-        self.user_text = user_text
-        self.non_harmonizers = non_harmonizers
-        self.harmonizers = harmonizers
-        self.iterations = iterations
-
-    def run(self):
-        for tab in self.non_harmonizers:
-            tab.log_signal.emit("--- Initial Broadcast ---")
-            tab.send_message_sync(self.user_text)
-
-        if self.iterations <= 0:
-            self.finished_signal.emit()
-            return
-
-        if len(self.non_harmonizers) < 2:
-            for tab in self.non_harmonizers:
-                tab.log_signal.emit(
-                    "[FOO] Need at least 2 active non-harmonizer agents for critique cycles. Stopping after broadcast."
-                )
-            self.finished_signal.emit()
-            return
-
-        for cycle in range(1, self.iterations + 1):
-            for source in self.non_harmonizers:
-                vuln_msg = (
-                    f"Agent {source.name} answered the same question as follows, find flaws: "
-                    f"{source.latest_response}"
-                )
-                critiques = {}
-                for reviewer in self.non_harmonizers:
-                    if reviewer is source:
-                        continue
-                    reviewer.log_signal.emit(
-                        f"--- Cycle {cycle} | Vulnerability: critique of {source.name} ---"
-                    )
-                    critiques[reviewer.name] = reviewer.send_message_sync(vuln_msg)
-
-                composite = "".join(
-                    f"\n \n Agent {name}: {resp}" for name, resp in critiques.items()
-                )
-
-                harmonizer_outputs = []
-                for harmonizer in self.harmonizers:
-                    if harmonizer.harmonizer_directive:
-                        directive = harmonizer.harmonizer_directive.replace(
-                            "{source_agent_name}", source.name
-                        )
-                    else:
-                        directive = HARMONIZER_FALLBACK_DIRECTIVE.format(
-                            source_agent_name=source.name
-                        )
-                    judgment_msg = f"{directive} \n \n {composite}"
-                    harmonizer.log_signal.emit(
-                        f"--- Cycle {cycle} | Judgment on {source.name} ---"
-                    )
-                    harmonizer_outputs.append(harmonizer.send_message_sync(judgment_msg))
-
-                reflection_input = (
-                    "---".join(harmonizer_outputs) if harmonizer_outputs else composite
-                )
-                reflection_msg = (
-                    "Judgment of your response has resulted in the observations that follow. "
-                    "Regenerate your version of the text under review taking into account the consensus of these observations. "
-                    "If you object to an observation, explain why. \n \n " + reflection_input
-                )
-                source.log_signal.emit(
-                    f"--- Cycle {cycle} | Reflection on {source.name} ---"
-                )
-                source.send_message_sync(reflection_msg)
-
-        self.finished_signal.emit()
-
-
-class MultiAgentChat(QWidget):
-    def __init__(self):
-        super().__init__()
-        with open("config.json", "r") as f:
-            config_data = json.load(f)
-        config = config_data["CONFIG"]
-        models = config_data["MODELS"]
-
-        self.user = config["user"]
-
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        if not openai.api_key:
-            print("API key is not set. Please set the OPENAI_API_KEY environment variable.")
-            exit(1)
-
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            print("Warning: ANTHROPIC_API_KEY not set. Claude agents will not function.")
-
-        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
-            print("Warning: GEMINI_API_KEY/GOOGLE_API_KEY not set. Gemini agents will not function.")
-
-        self.tabs = QTabWidget()
-        self.agent_tabs = []
-
-        for entry in models:
-            model_code = entry["model_code"]
-            if model_code.startswith("claude"):
-                engine = "claude"
-            elif model_code.startswith("gemini"):
-                engine = "google"
-            else:
-                engine = "openai"
-
-            harmonizer_raw = entry.get("harmonizer", False)
-            if isinstance(harmonizer_raw, bool):
-                harmonizer = harmonizer_raw
-            else:
-                harmonizer = str(harmonizer_raw).strip().lower() == "true"
-
-            tab = AgentTab(
-                model=model_code,
-                name=entry["agent_name"],
-                instructions=config["instructions"],
-                user=self.user,
-                engine=engine,
-                harmonizer=harmonizer,
-                harmonizer_directive=entry.get("harmonizer_directive", "") or "",
-            )
-            self.tabs.addTab(tab, entry["agent_name"])
-            self.agent_tabs.append(tab)
-
-        self.user_input = QLineEdit()
-        self.user_input.setPlaceholderText("Broadcast message to all active agents")
-        self.user_input.returnPressed.connect(self.broadcast_message)
-
-        self.iterations_spin = QSpinBox()
-        self.iterations_spin.setRange(0, 20)
-        self.iterations_spin.setValue(3)
-        self.iterations_spin.setFixedWidth(60)
-
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.user_input, 1)
-        input_row.addWidget(QLabel("FOO Cycles:"))
-        input_row.addWidget(self.iterations_spin)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.tabs)
-        layout.addWidget(QLabel("Message to All Active Agents:"))
-        layout.addLayout(input_row)
-        self.setLayout(layout)
-
-        self.setWindowTitle("Multi-Agent GPT + Claude + Gemini Interface")
-        self.resize(700, 500)
-
-        self.orchestrator = None
-
-    def broadcast_message(self):
-        text = self.user_input.text().strip()
-        if not text:
-            return
-        if self.orchestrator is not None and self.orchestrator.isRunning():
-            return
-
-        active = [t for t in self.agent_tabs if t.active]
-        non_harmonizers = [t for t in active if not t.harmonizer]
-        harmonizers = [t for t in active if t.harmonizer]
-
-        if not non_harmonizers:
-            return
-
-        self.user_input.clear()
-        self.user_input.setEnabled(False)
-        self.user_input.setPlaceholderText("FOO run in progress...")
-
-        self.orchestrator = FOOOrchestratorWorker(
-            user_text=text,
-            non_harmonizers=non_harmonizers,
-            harmonizers=harmonizers,
-            iterations=self.iterations_spin.value(),
-        )
-        self.orchestrator.finished_signal.connect(self.on_foo_finished)
-        self.orchestrator.start()
-
-    def on_foo_finished(self):
-        self.user_input.setEnabled(True)
-        self.user_input.setPlaceholderText("Broadcast message to all active agents")
-
+# Start the GUI application
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Single-Claude-agent chat GUI.")
+    parser.add_argument(
+        "role_md",
+        nargs="?",
+        default="general.md",
+        help="Path to a role markdown file (default: general.md). Examples: researcher.md, grant_writer_NIH.md, article_reviewer.md.",
+    )
+    args = parser.parse_args()
+
     app = QApplication([])
-    window = MultiAgentChat()
-    window.show()
+    chatbot = ClaudeChatbot(role_md_path=args.role_md)
+    chatbot.show()
     app.exec_()

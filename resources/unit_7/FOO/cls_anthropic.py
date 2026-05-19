@@ -16,7 +16,29 @@ import sys
 import uuid
 from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
-from cls_blockchain import IntegrityManager
+#from cls_blockchain import IntegrityManager
+
+
+def _extract_anthropic_usage(response):
+    """Pull token usage off an Anthropic Messages response. Returns None if absent."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    inp = getattr(usage, "input_tokens", None)
+    out = getattr(usage, "output_tokens", None)
+    return {"input": inp, "output": out, "total": (inp + out) if (inp is not None and out is not None) else None}
+
+
+# Anthropic deprecated the temperature parameter on Opus 4.7+. Older Sonnet/Haiku
+# still accept it. Returns {'temperature': value} only for models that allow it.
+_TEMPERATURE_DEPRECATED_PREFIXES = ("claude-opus-4-7",)
+
+
+def _temperature_kwarg(model, value):
+    for prefix in _TEMPERATURE_DEPRECATED_PREFIXES:
+        if model.startswith(prefix):
+            return {}
+    return {"temperature": value}
 
 
 class ClaudeWorker(QThread):
@@ -48,8 +70,8 @@ class ClaudeWorker(QThread):
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=100000,
-                temperature=0.99,
-                messages=clean_history
+                messages=clean_history,
+                **_temperature_kwarg(self.model, 0.99),
             )
             content = response.content[0].text
             
@@ -145,14 +167,15 @@ class AnthropicAgent:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=1000,
-                temperature=0.99,
-                messages=clean_history
+                messages=clean_history,
+                **_temperature_kwarg(self.model, 0.99),
             )
             content = response.content[0].text
-            
+
             # DO NOT add anything to history here - orchestrator handles this
             # Just update latest_response for copy functionality
             self.latest_response = content
+            self._last_usage = _extract_anthropic_usage(response)
             return content
             
         except Exception as e:
@@ -249,32 +272,96 @@ class AnthropicAgent:
             "message_count": len(self.history)
         }
 
-    def extract_text_from_pdf(self, file_path):
-        """Extract text from PDF file (compatible with ClaudeGUI.py)"""
-        try:
-            import PyPDF2
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            return text
-        except ImportError:
-            return "Error: PyPDF2 not installed. Please install it to process PDF files."
-        except Exception as e:
-            return f"Error extracting PDF text: {e}"
+    def process_file_upload(self, file_path, status_callback=None):
+        """Drag-and-drop file handler. Dispatches by file category:
 
-    def process_file_upload(self, file_path):
-        """Process file upload (compatible with ClaudeGUI.py drag-and-drop)"""
+        - Text (.txt/.md/.csv/.json/.yaml/source code/...): inline contents.
+        - Image (jpeg/png/gif/webp): native base64 image content block.
+        - PDF: native base64 document content block (preserves layout/images).
+
+        If status_callback is provided, it is called with short progress strings
+        (e.g. "Reading file (local)") so a GUI can show a spinner + status text.
+        After a successful API call, self._last_usage holds the token counts.
+        """
+        from file_loader import classify_file, read_text, read_base64
+
+        def _emit(msg):
+            if status_callback:
+                status_callback(msg)
+
         try:
-            if file_path.lower().endswith('.pdf'):
-                pdf_text = self.extract_text_from_pdf(file_path)
-                message = f"I've uploaded a PDF file. Here's the content:\n\n{pdf_text}\n\nPlease analyze this PDF content."
+            _emit("Classifying file (local)")
+            category, mime = classify_file(file_path)
+            filename = os.path.basename(file_path)
+
+            if category == "text":
+                _emit("Reading text file (local)")
+                text = read_text(file_path)
+                message = (
+                    f"I've uploaded a text file '{filename}'. Contents:\n\n"
+                    f"{text}\n\nPlease acknowledge and stand by for questions."
+                )
+                _emit("Sending to Anthropic Claude (remote)")
                 return self.send_message(message)
-            else:
-                return "Error: Only PDF files are currently supported."
+
+            if category == "image":
+                _emit("Base64-encoding image (local)")
+                b64 = read_base64(file_path)
+                _emit("Sending image to Anthropic Claude (remote)")
+                return self._send_with_blocks([
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": mime, "data": b64
+                    }},
+                    {"type": "text", "text": (
+                        f"I've attached an image '{filename}'. "
+                        "Please acknowledge and stand by for questions."
+                    )},
+                ])
+
+            if category == "pdf":
+                _emit("Base64-encoding PDF (local)")
+                b64 = read_base64(file_path)
+                _emit("Sending PDF to Anthropic Claude (remote)")
+                return self._send_with_blocks([
+                    {"type": "document", "source": {
+                        "type": "base64", "media_type": "application/pdf", "data": b64
+                    }},
+                    {"type": "text", "text": (
+                        f"I've attached a PDF '{filename}'. "
+                        "Please acknowledge and stand by for questions."
+                    )},
+                ])
+
+            return f"Unsupported file type: {mime or 'unknown'} ({filename})"
         except Exception as e:
             return f"Error processing file: {e}"
+
+    def _send_with_blocks(self, content_blocks):
+        """Send a user message whose content is a list of Anthropic content
+        blocks (image, document, text). Mirrors send_message() but takes
+        structured content. Does not mutate self.history (orchestrator owns it)."""
+        try:
+            clean_history = []
+            for entry in self.history:
+                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
+                    clean_history.append({
+                        "role": entry["role"],
+                        "content": entry["content"],
+                    })
+            clean_history.append({"role": "user", "content": content_blocks})
+
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                messages=clean_history,
+                **_temperature_kwarg(self.model, 0.99),
+            )
+            content = response.content[0].text
+            self.latest_response = content
+            self._last_usage = _extract_anthropic_usage(response)
+            return content
+        except Exception as e:
+            return f"Error: {e}"
         
     def get_integrity_display_text(self):
         """Get text to display integrity issues in GUI"""

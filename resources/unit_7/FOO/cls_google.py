@@ -17,12 +17,23 @@ from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
 from google import genai
 from google.genai import types
-from cls_blockchain import IntegrityManager
+#from cls_blockchain import IntegrityManager
 
 
 def _to_gemini_role(role):
     # Gemini uses "model" where Claude/OpenAI use "assistant"
     return "model" if role == "assistant" else "user"
+
+
+def _extract_gemini_usage(response):
+    """Pull token usage off a Gemini generate_content response. Returns None if absent."""
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None:
+        return None
+    inp = getattr(meta, "prompt_token_count", None)
+    out = getattr(meta, "candidates_token_count", None)
+    tot = getattr(meta, "total_token_count", None)
+    return {"input": inp, "output": out, "total": tot}
 
 
 def _history_to_contents(history):
@@ -169,6 +180,7 @@ class GoogleAgent:
 
             # DO NOT add anything to history here - orchestrator handles this
             self.latest_response = content
+            self._last_usage = _extract_gemini_usage(response)
             return content
 
         except Exception as e:
@@ -264,30 +276,68 @@ class GoogleAgent:
             "message_count": len(self.history),
         }
 
-    def extract_text_from_pdf(self, file_path):
-        """Extract text from a PDF file"""
-        try:
-            import PyPDF2
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            return text
-        except ImportError:
-            return "Error: PyPDF2 not installed. Please install it to process PDF files."
-        except Exception as e:
-            return f"Error extracting PDF text: {e}"
+    def process_file_upload(self, file_path, status_callback=None):
+        """Drag-and-drop file handler. Dispatches by file category:
 
-    def process_file_upload(self, file_path):
-        """Process file upload (compatible with GUI drag-and-drop)"""
+        - Text (.txt/.md/.csv/.json/.yaml/source code/...): inline contents.
+        - Image / PDF: upload via the Gemini Files API and reference it in
+          the next generate_content call (preserves images and layout).
+
+        If status_callback is provided, it is called with short progress
+        strings. After a successful API call, self._last_usage holds the
+        token counts.
+        """
+        import time
+        from file_loader import classify_file, read_text
+
+        def _emit(msg):
+            if status_callback:
+                status_callback(msg)
+
         try:
-            if file_path.lower().endswith('.pdf'):
-                pdf_text = self.extract_text_from_pdf(file_path)
-                message = f"I've uploaded a PDF file. Here's the content:\n\n{pdf_text}\n\nPlease analyze this PDF content."
+            _emit("Classifying file (local)")
+            category, mime = classify_file(file_path)
+            filename = os.path.basename(file_path)
+
+            if category == "text":
+                _emit("Reading text file (local)")
+                text = read_text(file_path)
+                message = (
+                    f"I've uploaded a text file '{filename}'. Contents:\n\n"
+                    f"{text}\n\nPlease acknowledge and stand by for questions."
+                )
+                _emit("Sending to Google Gemini (remote)")
                 return self.send_message(message)
-            else:
-                return "Error: Only PDF files are currently supported."
+
+            if category in ("image", "pdf"):
+                _emit("Uploading to Gemini Files API (remote)")
+                my_file = self.client.files.upload(file=file_path)
+                # Wait for asynchronous processing (PDF/video) to finish.
+                if getattr(my_file, "state", None) and str(my_file.state).endswith("PROCESSING"):
+                    _emit("Waiting for Gemini to process file (remote)")
+                while getattr(my_file, "state", None) and str(my_file.state).endswith("PROCESSING"):
+                    time.sleep(1)
+                    my_file = self.client.files.get(name=my_file.name)
+                _emit("Generating response from Google Gemini (remote)")
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=[
+                        my_file,
+                        (
+                            f"I've attached '{filename}'. "
+                            "Please acknowledge and stand by for questions."
+                        ),
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.instructions,
+                    ),
+                )
+                content = response.text
+                self.latest_response = content
+                self._last_usage = _extract_gemini_usage(response)
+                return content
+
+            return f"Unsupported file type: {mime or 'unknown'} ({filename})"
         except Exception as e:
             return f"Error processing file: {e}"
 

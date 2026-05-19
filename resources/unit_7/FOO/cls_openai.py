@@ -16,7 +16,18 @@ import json
 import sys
 from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
-from cls_blockchain import IntegrityManager
+# from cls_blockchain import IntegrityManager
+
+
+def _extract_openai_usage(response):
+    """Pull token usage off an OpenAI Responses API response. Returns None if absent."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    inp = getattr(usage, "input_tokens", None)
+    out = getattr(usage, "output_tokens", None)
+    tot = getattr(usage, "total_tokens", None)
+    return {"input": inp, "output": out, "total": tot}
 
 
 class _ConversationHandle:
@@ -132,6 +143,7 @@ class OpenAIAgent:
         self.previous_response_id = response.id
         text = response.output_text
         self.latest_response = text
+        self._last_usage = _extract_openai_usage(response)
         return text
 
     def upload_file(self, file_path):
@@ -173,6 +185,98 @@ class OpenAIAgent:
         try:
             self.is_busy = True
             return self._invoke_response(message)
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            self.is_busy = False
+
+    def process_file_upload(self, file_path, status_callback=None):
+        """Drag-and-drop file handler. Dispatches by file category:
+
+        - Text (.txt/.md/.csv/.json/.yaml/source code/...): inline contents.
+        - Image: base64 input_image content block in the next Responses call.
+        - PDF: base64 input_file content block in the next Responses call
+          (preserves layout and embedded images).
+
+        If status_callback is provided, it is called with short progress
+        strings. After a successful API call, self._last_usage holds the
+        token counts.
+        """
+        from file_loader import classify_file, read_text, read_base64
+
+        def _emit(msg):
+            if status_callback:
+                status_callback(msg)
+
+        try:
+            _emit("Classifying file (local)")
+            category, mime = classify_file(file_path)
+            filename = os.path.basename(file_path)
+
+            if category == "text":
+                _emit("Reading text file (local)")
+                text = read_text(file_path)
+                message = (
+                    f"I've uploaded a text file '{filename}'. Contents:\n\n"
+                    f"{text}\n\nPlease acknowledge and stand by for questions."
+                )
+                _emit("Sending to OpenAI Responses API (remote)")
+                return self.send_message(message)
+
+            if category == "image":
+                _emit("Base64-encoding image (local)")
+                b64 = read_base64(file_path)
+                _emit("Sending image to OpenAI Responses API (remote)")
+                return self._invoke_with_content([
+                    {"type": "input_image",
+                     "image_url": f"data:{mime};base64,{b64}"},
+                    {"type": "input_text", "text": (
+                        f"I've attached an image '{filename}'. "
+                        "Please acknowledge and stand by for questions."
+                    )},
+                ])
+
+            if category == "pdf":
+                _emit("Base64-encoding PDF (local)")
+                b64 = read_base64(file_path)
+                _emit("Sending PDF to OpenAI Responses API (remote)")
+                return self._invoke_with_content([
+                    {"type": "input_file",
+                     "filename": filename,
+                     "file_data": f"data:application/pdf;base64,{b64}"},
+                    {"type": "input_text", "text": (
+                        f"I've attached a PDF '{filename}'. "
+                        "Please acknowledge and stand by for questions."
+                    )},
+                ])
+
+            return f"Unsupported file type: {mime or 'unknown'} ({filename})"
+        except Exception as e:
+            return f"Error processing file: {e}"
+
+    def _invoke_with_content(self, content_blocks):
+        """Send a Responses API call whose user message has structured content
+        (input_text / input_image / input_file). Updates previous_response_id."""
+        if self.is_busy:
+            return f"Agent {self.name} is busy processing a previous request. Please wait."
+        try:
+            self.is_busy = True
+            kwargs = {
+                "model": self.model,
+                "instructions": self.instructions,
+                "input": [{"role": "user", "content": content_blocks}],
+            }
+            if self.previous_response_id:
+                kwargs["previous_response_id"] = self.previous_response_id
+            tools = self._tools()
+            if tools:
+                kwargs["tools"] = tools
+            response = self.client.responses.create(**kwargs)
+            self.previous_response_id = response.id
+            text = response.output_text
+            self.latest_response = text
+            self._last_usage = _extract_openai_usage(response)
+            return text
         except Exception as e:
             return f"Error: {e}"
         finally:

@@ -12,16 +12,20 @@ License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0
 import os
 import sys
 import json
+import glob
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QTextEdit, QLineEdit, QVBoxLayout,
     QPushButton, QTabWidget, QHBoxLayout, QCheckBox, QLabel, QScrollArea,
-    QFileDialog, QMessageBox
+    QFileDialog, QMessageBox, QComboBox, QProgressBar
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QEvent, Qt, QUrl, QTimer
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont
 
 from cls_foo import MultiAgentOrchestrator
+from md_widget import MarkdownTextEdit
+from md_loader import load_persona
+from file_upload_worker import FileUploadWorker, format_usage
 
 
 class BroadcastTextEdit(QTextEdit):
@@ -205,16 +209,21 @@ class AgentTab(QWidget):
         self.config = config
         self.user = orchestrator.user
         self.name = agent.name
-        
+        self.loaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         # Initialize worker references
         self.worker = None
         self.vulnerability_worker = None
         self.judgment_worker = None
         self.reflection_worker = None
-        
+
         # Initialize UI first
         self.init_ui()
-        
+
+        # Print session header so the user can see which model and version
+        # is behind this tab, plus when the session loaded.
+        self._display_session_header()
+
         # Check if history was already loaded during agent initialization
         has_history = hasattr(agent, 'history_data') and agent.history_data.get('history')
         if has_history and len(agent.history_data['history']) > 1:
@@ -225,6 +234,24 @@ class AgentTab(QWidget):
         else:
             # No history exists - this is a new chat, so introduce
             self.handle_input("Introduce yourself.")
+
+    def _provider_for(self, model_code):
+        if model_code.startswith("claude"):
+            return "Anthropic"
+        if model_code.startswith("gemini"):
+            return "Google"
+        return "OpenAI"
+
+    def _display_session_header(self):
+        model_code = getattr(self.agent, "model", "?")
+        provider = self._provider_for(model_code)
+        # Friendly model_name from MODELS entry, if present.
+        model_entry = getattr(self.agent, "model_entry", None) or {}
+        friendly = model_entry.get("model_name") or model_code
+        role = getattr(self.agent, "role_md", "?")
+        self.text_area.append(f"**Model:** {friendly} (`{model_code}`, {provider}) — **Loaded:** {self.loaded_at}")
+        self.text_area.append(f"**Agent:** {self.name} — **Role:** {role}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
 
     def closeEvent(self, event):
         """Handle widget closure by stopping all worker threads"""
@@ -253,7 +280,7 @@ class AgentTab(QWidget):
     
     def init_ui(self):
         layout = QVBoxLayout()
-        
+
         # Agent controls row
         row = QHBoxLayout()
         self.checkbox = QCheckBox(f"Enable {self.name}")
@@ -266,11 +293,37 @@ class AgentTab(QWidget):
         self.harmonizer_checkbox.stateChanged.connect(self.toggle_harmonizer)
         row.addWidget(self.harmonizer_checkbox)
 
+        # Per-tab role dropdown: switches the agent's persona at runtime.
+        row.addWidget(QLabel("Role:"))
+        self.role_combo = QComboBox()
+        self.role_combo.addItems(self._discover_md_files())
+        current_role = getattr(self.agent, "role_md", "general.md")
+        if current_role in [self.role_combo.itemText(i) for i in range(self.role_combo.count())]:
+            self.role_combo.setCurrentText(current_role)
+        self.role_combo.currentTextChanged.connect(self.on_role_changed)
+        row.addWidget(self.role_combo, 1)
+
         layout.addLayout(row)
 
-        # Text display area
-        self.text_area = QTextEdit()
-        self.text_area.setReadOnly(True)
+        # Status row: indeterminate progress bar + status label. Hidden when idle.
+        self.status_row = QWidget()
+        status_layout = QHBoxLayout(self.status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        self.upload_progress = QProgressBar()
+        self.upload_progress.setRange(0, 0)  # indeterminate (animated marquee)
+        self.upload_progress.setFixedWidth(140)
+        self.upload_progress.setTextVisible(False)
+        self.upload_status_label = QLabel("")
+        status_layout.addWidget(self.upload_progress)
+        status_layout.addWidget(self.upload_status_label, 1)
+        self.status_row.setVisible(False)
+        layout.addWidget(self.status_row)
+
+        # Holds the active upload worker so it isn't garbage-collected mid-run.
+        self.upload_worker = None
+
+        # Text display area (renders Markdown via setMarkdown)
+        self.text_area = MarkdownTextEdit()
         self.text_area.setAcceptDrops(True)  # Enable drag and drop like ClaudeGUI.py
         self.text_area.dragEnterEvent = self.dragEnterEvent
         self.text_area.dropEvent = self.dropEvent
@@ -306,13 +359,51 @@ class AgentTab(QWidget):
         
         # Apply font sizes
         fontsize = int(self.config.get("fontsize", 10))
-        for widget in [self.text_area, self.user_input, self.copy_button, 
-                      self.vulnerability_button, self.judgment_button, 
-                      self.reflection_button, self.checkbox, self.harmonizer_checkbox]:
+        for widget in [self.text_area, self.user_input, self.copy_button,
+                      self.vulnerability_button, self.judgment_button,
+                      self.reflection_button, self.checkbox, self.harmonizer_checkbox,
+                      self.role_combo, self.upload_status_label]:
             font = widget.font()
             font.setPointSize(fontsize)
             widget.setFont(font)
-    
+
+    def _discover_md_files(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(script_dir, "*.md")))
+        return [f for f in files if f != "common.md"]
+
+    def on_role_changed(self, new_role):
+        if not new_role or new_role == getattr(self.agent, "role_md", None):
+            return
+        common_md = getattr(self.agent, "common_md", "common.md")
+        try:
+            new_instructions = load_persona(common_md, new_role, {
+                "user": self.user,
+                "name": self.name,
+            })
+        except Exception as e:
+            self.text_area.append(f"**Failed to load role `{new_role}`:** {e}")
+            return
+        self.agent.role_md = new_role
+        self.agent.instructions = new_instructions
+        # Reset the conversation so the new persona doesn't inherit prior context.
+        try:
+            self.agent.reset_conversation()
+        except Exception as e:
+            self.text_area.append(f"**Warning during reset:** {e}")
+        self.text_area.clear()
+        self._display_session_header()
+        self.text_area.append(f"**Role changed to:** `{new_role}` — conversation reset.")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+    def apply_font_size(self, size):
+        font = QFont()
+        font.setPointSize(int(size))
+        for child in self.findChildren(QWidget):
+            child.setFont(font)
+        self.text_area.document().setDefaultFont(font)
+        self.text_area.rerender()
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Handle drag enter events (compatible with ClaudeGUI.py)"""
         if event.mimeData().hasUrls():
@@ -321,31 +412,91 @@ class AgentTab(QWidget):
             event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        """Handle file drop events (compatible with ClaudeGUI.py)"""
+        """Dropping a file on ANY tab broadcasts it to every active agent."""
         urls = event.mimeData().urls()
-        if urls:
-            file_path = urls[0].toLocalFile()
+        if not urls:
+            return
+        file_path = urls[0].toLocalFile()
+        main = self._find_main_window()
+        if main is not None:
+            main.broadcast_file(file_path)
+        else:
+            # Fallback: just deliver to this tab's agent.
             self.upload_file(file_path)
 
+    def _find_main_window(self):
+        parent = self.parent()
+        while parent is not None and not isinstance(parent, MultiAgentChatGUI):
+            parent = parent.parent()
+        return parent
+
     def upload_file(self, file_path):
-        """Upload file to agent"""
-        try:
-            if hasattr(self.agent, 'upload_file'):
-                # OpenAI agent - use upload_file method
-                file_id = self.agent.upload_file(file_path)
-                if file_id:
-                    self.text_area.append(f"File uploaded successfully: ID {file_id}")
-                    self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
-            elif hasattr(self.agent, 'process_file_upload'):
-                # Claude agent - use process_file_upload method
-                self.text_area.append(f"Processing file: {file_path}")
-                self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
-                response = self.agent.process_file_upload(file_path)
-                self.show_response(response)
-            else:
-                self.text_area.append(f"File upload not supported for {self.name}")
-        except Exception as e:
-            self.text_area.append(f"Error uploading file: {e}")
+        """Deliver one file to this tab's agent on a background thread.
+
+        Shows an indeterminate progress bar + status label while the worker
+        runs so the GUI isn't silent or appears frozen. When the API returns,
+        prints the response and the token usage (if reported)."""
+        if self.upload_worker is not None and self.upload_worker.isRunning():
+            self.text_area.append(f"_(Already uploading; ignored drop of `{file_path}`)_")
+            return
+
+        if not hasattr(self.agent, 'process_file_upload') and not hasattr(self.agent, 'upload_file'):
+            self.text_area.append(f"File upload not supported for {self.name}")
+            return
+
+        agent = self.agent
+        filename = os.path.basename(file_path)
+
+        def do_upload(status_cb):
+            # Runs on the worker thread. Returns (response_text, usage_dict|None).
+            if hasattr(agent, 'process_file_upload'):
+                try:
+                    response = agent.process_file_upload(file_path, status_callback=status_cb)
+                except TypeError:
+                    response = agent.process_file_upload(file_path)
+                usage = getattr(agent, '_last_usage', None)
+                return response, usage
+            # Legacy: only upload_file (vector store).
+            status_cb("Uploading to OpenAI vector store (remote)")
+            file_id = agent.upload_file(file_path)
+            return (f"File uploaded successfully: ID `{file_id}`" if file_id else "File upload failed."), None
+
+        self.text_area.append(f"**Processing file:** `{filename}`")
+        self.text_area.append(">>>>>>>>>>>>>>>>>>>>>>>>>>")
+        self._show_upload_status("Starting upload...")
+
+        self.upload_worker = FileUploadWorker(do_upload)
+        self.upload_worker.status.connect(self._on_upload_status)
+        self.upload_worker.finished_ok.connect(self._on_upload_finished)
+        self.upload_worker.finished_err.connect(self._on_upload_error)
+        self.upload_worker.start()
+
+    def _show_upload_status(self, msg):
+        self.upload_status_label.setText(msg)
+        self.status_row.setVisible(True)
+
+    def _hide_upload_status(self):
+        self.status_row.setVisible(False)
+        self.upload_status_label.setText("")
+
+    def _on_upload_status(self, msg):
+        self._show_upload_status(msg)
+        # Also echo a faint trail in the chat log so the user has a record.
+        self.text_area.append(f"_…{msg}_")
+
+    def _on_upload_finished(self, response, usage):
+        usage_str = format_usage(usage) if usage else ""
+        if usage_str:
+            self.text_area.append(f"_Done — tokens: {usage_str}_")
+        else:
+            self.text_area.append("_Done._")
+        self._hide_upload_status()
+        self.show_response(response)
+
+    def _on_upload_error(self, msg):
+        self._hide_upload_status()
+        self.text_area.append(f"**Upload error:** {msg}")
+        self.text_area.append("<<<<<<<<<<<<<<<<<<<<<<<<<<")
 
     def toggle_active(self, state):
         """Toggle agent active state"""
@@ -859,10 +1010,23 @@ class MultiAgentChatGUI(QWidget):
         self.setWindowTitle(f"The Flaws of Others - Multi-agent Consensus - CWD: {cwd}")
         self.setGeometry(100, 100, 800, 600)
         self.setAcceptDrops(True)  # Enable drag and drop
-        
+
         # Get font size from config
         fontsize = int(self.orchestrator.config.get("fontsize", 10))
-        
+        self.font_size = fontsize
+
+        # Top header row: spacer + Font - / + buttons (top right)
+        self.header_layout = QHBoxLayout()
+        self.header_layout.addStretch()
+        self.font_dec_btn = QPushButton("-")
+        self.font_dec_btn.setFixedWidth(32)
+        self.font_dec_btn.clicked.connect(lambda: self.apply_font_size(self.font_size - 1))
+        self.font_inc_btn = QPushButton("+")
+        self.font_inc_btn.setFixedWidth(32)
+        self.font_inc_btn.clicked.connect(lambda: self.apply_font_size(self.font_size + 1))
+        self.header_layout.addWidget(self.font_dec_btn)
+        self.header_layout.addWidget(self.font_inc_btn)
+
         # Create tab widget
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(f"QTabBar::tab {{ font-size: {fontsize}pt; min-width: {fontsize * 15}px; padding: 10px; }}")
@@ -892,8 +1056,9 @@ class MultiAgentChatGUI(QWidget):
         
         # Layout
         layout = QVBoxLayout()
+        layout.addLayout(self.header_layout)
         layout.addWidget(self.tabs)
-        
+
         label = QLabel("Message to All Active Agents:")
         font = label.font()
         font.setPointSize(fontsize)
@@ -906,8 +1071,40 @@ class MultiAgentChatGUI(QWidget):
         bottom_layout.addWidget(self.load_button)
         bottom_layout.addWidget(self.user_input, 1)
         layout.addLayout(bottom_layout)
-        
+
         self.setLayout(layout)
+
+    def broadcast_file(self, file_path):
+        """Send one file to every active agent's native upload pathway."""
+        active_tabs = [t for t in getattr(self, "agent_tabs", []) if getattr(t.agent, "active", True)]
+        if not active_tabs:
+            return
+        for tab in active_tabs:
+            try:
+                tab.upload_file(file_path)
+            except Exception as e:
+                print(f"broadcast_file: error delivering to {tab.name}: {e}")
+
+    def apply_font_size(self, size):
+        # Propagates font size to the main window's children and every agent tab.
+        self.font_size = max(6, min(48, int(size)))
+        font = QFont()
+        font.setPointSize(self.font_size)
+        for child in self.findChildren(QWidget):
+            if isinstance(child, AgentTab):
+                continue  # AgentTab handles its own widgets via apply_font_size below.
+            child.setFont(font)
+        # Keep the QTabBar styling in sync with the new size.
+        self.tabs.setStyleSheet(
+            f"QTabBar::tab {{ font-size: {self.font_size}pt; "
+            f"min-width: {self.font_size * 15}px; padding: 10px; }}"
+        )
+        # Cascade into each agent tab so MarkdownTextEdit rerenders.
+        for tab in getattr(self, "agent_tabs", []):
+            try:
+                tab.apply_font_size(self.font_size)
+            except Exception:
+                pass
 
     def create_agent_tabs(self):
         """Create tabs for each agent"""
