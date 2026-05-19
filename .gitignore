@@ -1,7 +1,11 @@
 # local files and folders
 specs/*
+data/*
 .claude
 resources/unit_7/connectivity_config.json
+resources/unit_7/slides_7.1/*
+resources/unit_7/slides_7.2/*
+resources/unit_7/slides_7.3/*
 
 ## Core latex/pdflatex auxiliary files:
 *.aux
