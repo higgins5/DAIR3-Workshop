@@ -18,7 +18,7 @@ from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, Polynomial
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 IMAGE_DIR = ROOT / "images"
-RANDOM_STATE = 42
+RANDOM_STATE = 23
 
 pd.options.plotting.backend = "plotly"
 pio.templates["palatino_white"] = go.layout.Template(pio.templates["plotly_white"])
@@ -103,6 +103,25 @@ def regression_metrics(y_true, predictions):
     })
 
 
+def model_diagnostics(fit_pipeline, X_train, X_test, y_train, y_test):
+    train_predictions = fit_pipeline.predict(X_train)
+    test_predictions = fit_pipeline.predict(X_test)
+
+    def summarize(y_true, predictions):
+        mse = mean_squared_error(y_true, predictions)
+        return pd.Series({
+            "MSE": mse,
+            "RMSE": mse ** 0.5,
+            "MAE": mean_absolute_error(y_true, predictions),
+            "R^2": r2_score(y_true, predictions),
+        })
+
+    return pd.DataFrame({
+        "train": summarize(y_train, train_predictions),
+        "test": summarize(y_test, test_predictions),
+    }).loc[["MSE", "RMSE", "MAE", "R^2"]]
+
+
 def train_test_evaluate(model, X, y, test_size=0.2, random_state=RANDOM_STATE):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
     model.fit(X_train, y_train)
@@ -129,6 +148,39 @@ def compute_vif(X_numeric):
     }).sort_values("VIF", ascending=False)
 
 
+def cramers_v(x, y, bias_corrected=True):
+    table = pd.crosstab(x, y)
+    observed = table.to_numpy(dtype=float)
+    n = observed.sum()
+    if n == 0 or min(observed.shape) < 2:
+        return np.nan
+
+    row_sums = observed.sum(axis=1)
+    col_sums = observed.sum(axis=0)
+    expected = np.outer(row_sums, col_sums) / n
+    with np.errstate(divide="ignore", invalid="ignore"):
+        chi2 = np.nansum((observed - expected) ** 2 / expected)
+
+    r, k = observed.shape
+    phi2 = chi2 / n
+    if not bias_corrected:
+        return np.sqrt(phi2 / min(k - 1, r - 1))
+
+    phi2_corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
+    r_corr = r - ((r - 1) ** 2) / (n - 1)
+    k_corr = k - ((k - 1) ** 2) / (n - 1)
+    denom = min(k_corr - 1, r_corr - 1)
+    return np.sqrt(phi2_corr / denom) if denom > 0 else np.nan
+
+
+def categorical_association_matrix(df, columns):
+    matrix = pd.DataFrame(index=columns, columns=columns, dtype=float)
+    for col_a in columns:
+        for col_b in columns:
+            matrix.loc[col_a, col_b] = 1.0 if col_a == col_b else cramers_v(df[col_a], df[col_b])
+    return matrix
+
+
 def residual_frame(result):
     return result["X_test"].copy().assign(
         actual=result["y_test"].to_numpy(),
@@ -138,14 +190,22 @@ def residual_frame(result):
 
 
 def subgroup_metrics(frame, actual_col="actual", pred_col="predicted", group_col="urbanicity"):
+    columns = ["n", "MSE", "RMSE", "MAE", "R^2", "mean_residual"]
+
     def summarize(group):
+        mse = mean_squared_error(group[actual_col], group[pred_col])
         return pd.Series({
             "n": len(group),
+            "MSE": mse,
+            "RMSE": mse ** 0.5,
             "MAE": mean_absolute_error(group[actual_col], group[pred_col]),
-            "RMSE": mean_squared_error(group[actual_col], group[pred_col]) ** 0.5,
+            "R^2": r2_score(group[actual_col], group[pred_col]) if len(group) > 1 else np.nan,
             "mean_residual": (group[actual_col] - group[pred_col]).mean(),
         })
-    return frame.groupby(group_col, observed=True).apply(summarize).sort_values("MAE", ascending=False)
+
+    summary = frame.groupby(group_col, observed=True).apply(summarize).sort_values("MAE", ascending=False)
+    summary["n"] = summary["n"].astype(int)
+    return summary[columns]
 
 
 def pipeline_coefficients(model, model_step="model", preprocessor_step="preprocessor"):
