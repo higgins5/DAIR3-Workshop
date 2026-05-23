@@ -1,0 +1,7 @@
+all: execute 
+
+
+html: Unit5.ipynb 
+	jupyter nbconvert --to html Unit5.ipynb
+
+

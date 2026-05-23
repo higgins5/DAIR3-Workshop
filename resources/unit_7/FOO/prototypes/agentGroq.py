@@ -9,14 +9,16 @@ License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0
 """
 import os
 
-from langchain.chains import LLMChain
+from langchain_classic.chains import LLMChain
+#from langchain.chains import LLMChain
 from langchain_core.prompts import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
     MessagesPlaceholder,
 )
+
 from langchain_core.messages import SystemMessage
-from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+from langchain_classic.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
 
 
@@ -27,7 +29,8 @@ def main():
 
     # Get Groq API key
     groq_api_key = os.environ['GROQ_API_KEY']
-    model = 'llama3-8b-8192'
+    #model = 'llama3-8b-8192'
+    model = 'llama-3.1-8b-instant'
     # Initialize Groq Langchain chat object and conversation
     groq_chat = ChatGroq(
             groq_api_key=groq_api_key, 
