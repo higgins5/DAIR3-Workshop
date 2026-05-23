@@ -15,29 +15,7 @@ University of Texas at San Antonio.
 License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
 """
 import argparse
-<<<<<<< HEAD
 from single_agent_gui import launch
-=======
-import base64
-import mimetypes
-from datetime import datetime
-import anthropic
-<<<<<<< HEAD
-=======
-import google 
-from google import genai
-from google.genai import types
->>>>>>> 4d036c6 (preworkshop analysis updates, modified agent scripts)
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLineEdit, QVBoxLayout, QPushButton,
-    QHBoxLayout, QLabel, QComboBox, QProgressBar
-)
-from PyQt5.QtCore import QThread, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont
-from md_widget import MarkdownTextEdit
-from md_loader import load_persona
-from file_upload_worker import FileUploadWorker, format_usage
->>>>>>> db0e051 (added FOO files, chats, agents, config, README, etc. that were missing)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,244 @@
+---
+title: 5.2 Reproducibility via Code Notebooks _and_
+jupyter:
+  jupytext:
+    formats: ipynb,qmd
+    text_representation:
+      extension: .qmd
+      format_name: quarto
+      format_version: '1.0'
+      jupytext_version: 1.19.3
+  kernelspec:
+    display_name: DAIR3 (3.12.13)
+    language: python
+    name: python3
+---
+
+# 5.4 Best Practices for Reproducible Coding 
+
+
+5.2 Create a notebook that does some simple EDA on some data. It should generate at **least one plot and at least one table**. Create a script to download the CDC dataset. Upload your work
+
+5.4 Add documentation to your simple EDA notebook. Create a Makefile similar to the one shown in class (e.g., with commands to download the data, run the analysis, etc.). Upload your analysis file.
+
+## Setup
+
+This setup uses code from Dr. Rampure to import libraries and define functions for working with the CDC data. 
+
+```{python}
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+
+from IPython.display import display
+from sklearn.compose import ColumnTransformer, make_column_transformer, make_column_selector
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, GridSearchCV, cross_validate, train_test_split
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, PolynomialFeatures, StandardScaler
+
+ROOT = Path("/Users/higgins/Documents/UWGrad/Conferences_Apps_Projects/DAIR3/DAIR3-Workshop/resources/unit_4")
+DATA_DIR = ROOT / "data"
+IMAGE_DIR = ROOT / "images"
+RANDOM_STATE = 42
+
+pd.options.plotting.backend = "plotly"
+pio.templates["palatino_white"] = go.layout.Template(pio.templates["plotly_white"])
+pio.templates["palatino_white"].layout.font.family = "Palatino, Palatino Linotype, Book Antiqua, serif"
+pio.templates["palatino_white"].data.scatter = [go.Scatter(marker={"size": 8})]
+pio.templates["palatino_white"].data.scattergl = [go.Scattergl(marker={"size": 8})]
+pio.templates.default = "palatino_white"
+px.defaults.template = "palatino_white"
+px.defaults.width = 840
+px.defaults.height = 460
+
+
+def display_df(df, rows=10):
+    return display(df.head(rows))
+
+
+def make_polynomial_sample(n=80, random_state=23):
+    rng = np.random.default_rng(random_state)
+    x = np.linspace(-5, 5, n)
+    y = 2 + 0.8 * x - 0.35 * x ** 2 + 0.08 * x ** 3 + rng.normal(0, 3, n)
+    return pd.DataFrame({"x": x, "y": y})
+
+
+def one_hot_encoder(**kwargs):
+    try:
+        return OneHotEncoder(sparse_output=False, **kwargs)
+    except TypeError:
+        return OneHotEncoder(sparse=False, **kwargs)
+
+
+def find_birthweight_file(year=1971):
+    candidates = [
+        DATA_DIR / f"{year}.csv.gz",
+        ROOT.parent / "DAIR3-Workshop" / "resources" / "unit_3" / "data" / f"{year}.csv.gz",
+        ROOT.parent / "resources" / "unit_3" / "data" / f"{year}.csv.gz",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = "\n".join(f"- {candidate}" for candidate in candidates)
+    raise FileNotFoundError(
+        "Could not find the prepared NCHS birthweight CSV. "
+        "Run the Unit 3 prep.py script first, or place 1971.csv.gz in materials-draft/data.\n"
+        f"Searched:\n{searched}"
+    )
+
+
+def load_birthweight_1971():
+    return pd.read_csv(find_birthweight_file(1971))
+
+
+def prepare_birthweight_modeling_data():
+    births = load_birthweight_1971()
+    cols = ["birthweight", "sex", "momage", "dadage", "plurality", "birthorder"]
+    return births[cols].dropna().copy()
+```
+
+# EXAMPLE ONE - CDC 
+
+## Read in birthweight data
+
+```{python}
+try:
+    births = load_birthweight_1971()
+    print(f"Loaded {births.shape[0]:,} births and {births.shape[1]:,} columns.")
+    display(births.sample(5))
+except FileNotFoundError as err:
+    births = None
+    print(err)
+```
+
+## Descriptive Table 
+
+Look at a descriptive table, examining the outcome grouped by plurality (assuming this is of interest to subsequent analysis questions) 
+
+```{python}
+print(births.groupby("plurality")['birthweight'].describe())
+```
+
+## Plot 
+
+Plot birthweight distribution by plurality 
+
+```{python}
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12, 6))
+
+sns.violinplot(
+    data=births,
+    x="plurality",
+    y="birthweight"
+)
+
+plt.xticks(rotation=45, ha="right")
+plt.xlabel("Plurality")
+plt.ylabel("Mean birthweight, grams")
+plt.title("Mean Birthweight by Plurality with 95% Confidence Intervals")
+plt.tight_layout()
+plt.show()
+```
+
+# EXAMPLE TWO: study data 
+
+This example uses data we collected and I will be using for a poster presentation next month
+
+```{python}
+# Read in T2-FLAIR self-report data from study drive 
+
+t2flair = pd.read_csv("/Volumes/study/maia/intermediate_data/self_report/prelim_t2flair_selfreport_March2026.csv")
+
+print(t2flair.head(10))
+```
+
+```{python}
+# Read in brain lesion data from study drive
+
+prelim_lesions=pd.read_csv("/Volumes/study/maia/intermediate_data/t2_flair/lst_lpa_march26.csv")
+print(prelim_lesions.head(10))
+```
+
+Get info and subset relevant columns
+
+```{python}
+t2flair.info()
+
+list(t2flair.columns)
+
+t2flair_subset=t2flair[["subject_id", "acq_totalscore_sm",
+                        "promis_sf_v10_depression_8a_tscore",
+                        "promis_sf_v10_anxiety_8a_tscore",
+                        "promis_bank_v10_sleep_disturbance_tscore",
+                        "dem_age_smc", "dem_sex_at_birth",
+                        "asth_grp","ace_sum_binary", "pss_sum", "shaps_sum"]]
+
+```
+
+Merge data
+
+```{python}
+# Merge data 
+merged_data = pd.merge(t2flair_subset, prelim_lesions, on="subject_id", how="inner")
+print(merged_data)
+```
+
+```{python}
+print(vars(merged_data))
+
+# make asthma group a category for plotting
+merged_data["asth_grp"] = merged_data["asth_grp"].astype("category")
+```
+
+## Descriptive Stats/Table 
+
+```{python}
+# Describe 
+
+descriptives=merged_data.describe()
+
+print(descriptives)
+```
+
+## Visuals
+
+### Lesions by Group
+
+Visualize distributions of lesion number by group (severe asthma vs healthy controls)
+
+```{python}
+from plotnine import *
+
+plot = (
+    ggplot(merged_data, aes(x='asth_grp', y='num_lesions', fill='asth_grp'))
+    + geom_violin(alpha=0.5)
+    + geom_boxplot(width=0.1, color="black", fill="white")
+    + labs(x="Asthma Group", y="Number of Lesions", fill="Asthma Group")
+)
+
+plot
+```
+
+## Depression-Lesions by Group
+
+Visualize potential relationship between depressive symptom scores and number of lesions, by group (severe asthma vs healthy control)
+
+```{python}
+plot2 = (
+    ggplot(merged_data, aes(x='promis_sf_v10_depression_8a_tscore', y='num_lesions', color='asth_grp'))
+    + geom_point(alpha=0.5) + geom_smooth(method='lm', se=True)
+    + labs(x="Depression T-Score", y="Number of Lesions", color="Asthma Group")
+)
+
+plot2
+```
